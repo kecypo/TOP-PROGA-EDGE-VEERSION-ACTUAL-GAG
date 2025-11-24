@@ -1,299 +1,298 @@
 import time
+from typing import Callable, Optional, Sequence
 
 
 class HpActionController:
-    def __init__(
-        self,
-        send_command_callback,
-        spoil_key="F2",
-        no_target_command=None,
-        dead_target_command=None,
-        alive_target_command=None,
-        spoil_enabled=True,
-        cooldown_sec=0.5,
-        # Новые опции:
-        far_target_command=None,
-        hp_stable_threshold_sec=2.0,
-        hp_change_epsilon=0.01,
+    STATE_NO_TARGET = "no_target"
+    STATE_DEAD_TARGET = "dead_target"
+    STATE_ALIVE_TARGET = "alive_target"
+    STATE_FAR_TARGET = "far_target"
+
+    def __init__(self,
+        send_command_callback: Callable[[str], None],
+        spoil_key: str = "F2",
+        no_target_command: Optional[Sequence[str]] = None,
+        dead_target_command: Optional[Sequence[str]] = None,
+        alive_target_command: Optional[Sequence[str]] = None,
+        spoil_enabled: bool = True,
+        cooldown_sec: float = 0.5,
+        far_target_command: Optional[Sequence[str]] = None,
+        hp_stable_threshold_sec: float = 2.0,
+        hp_change_epsilon: float = 0.01,
+        far_transient: bool = True,
     ):
         """
-        Контроллер для управления действиями по HP цели с поддержкой спойла и свипа.
-
-        :param send_command_callback: функция для отправки команды (строка, например 'F2')
-        :param spoil_key: команда для спойла (например, 'F2')
-        :param no_target_command: команда при отсутствии цели
-        :param dead_target_command: команда при мёртвой цели
-        :param alive_target_command: команда при живой цели (атака)
-        :param spoil_enabled: включён ли спойл
-        :param cooldown_sec: минимальный интервал между отправками команд
-        :param far_target_command: команда при состоянии "далеко" (цель жива, но HP стабильный)
-        :param hp_stable_threshold_sec: сколько секунд HP должен не изменяться, чтобы считаться "далеко"
-        :param hp_change_epsilon: порог изменения HP, считающийся значимым (float)
+        Контроллер действий по HP цели.
+        Поддерживает последовательности команд для каждого состояния — список команд отправляется по очереди.
         """
         self.send_command_callback = send_command_callback
 
         self.spoil_key = spoil_key
-        self.no_target_command = no_target_command
-        self.dead_target_command = dead_target_command
-        self.alive_target_command = alive_target_command
-
-        # Новое:
-        self.far_target_command = far_target_command
-        self.hp_stable_threshold_sec = hp_stable_threshold_sec
-        self.hp_change_epsilon = hp_change_epsilon
+        # команды храним как списки (последовательности). Для совместимости допускаем и строки в сеттерах.
+        self.no_target_sequence = list(no_target_command) if no_target_command else []
+        self.dead_target_sequence = list(dead_target_command) if dead_target_command else []
+        self.alive_target_sequence = list(alive_target_command) if alive_target_command else []
+        self.far_target_sequence = list(far_target_command) if far_target_command else []
 
         self.spoil_enabled = spoil_enabled
-        self.cooldown_sec = cooldown_sec
+        self.cooldown_sec = float(cooldown_sec)
 
-        self.current_state = None  # "no_target", "dead_target", "alive_target", None
-        self.last_command = None
-        self.last_command_time = 0
+        # far detection params
+        self.hp_stable_threshold_sec = float(hp_stable_threshold_sec)
+        self.hp_change_epsilon = float(hp_change_epsilon)
+        self.far_transient = bool(far_transient)
 
-        self.spoil_active = None
-        self.waiting_for_sweep = False
+        # runtime
+        self.current_state: Optional[str] = None
+        self.last_command: Optional[str] = None
+        self.last_command_time: float = 0.0
 
-        # Для трекинга изменений HP (новое)
-        self.hp_last_value = None
-        self.hp_last_change_time = 0.0
+        self.spoil_active: Optional[bool] = None
+        self.waiting_for_sweep: bool = False
 
-        self.enabled = True  # общий флаг включения контроллера
+        # hp tracking
+        self.hp_last_value: Optional[float] = None
+        self.hp_last_change_time: float = 0.0
 
-    def set_spoil_key(self, key: str):
-        print(f"[HpActionController] Установлен spoil_key: {key}")
-        self.spoil_key = key.strip()
+        # far sent time to avoid duplicate far sends for same stability period
+        self.far_sent_time: Optional[float] = None
 
-    def set_no_target_command(self, cmd: str):
-        print(f"[HpActionController] Установлена команда no_target: {cmd}")
-        self.no_target_command = cmd.strip() if cmd else None
+        # indices for sequences: rotate through each sequence
+        self._seq_indices = {
+            self.STATE_NO_TARGET: 0,
+            self.STATE_DEAD_TARGET: 0,
+            self.STATE_ALIVE_TARGET: 0,
+            self.STATE_FAR_TARGET: 0,
+        }
 
-    def set_dead_target_command(self, cmd: str):
-        print(f"[HpActionController] Установлена команда dead_target: {cmd}")
-        self.dead_target_command = cmd.strip() if cmd else None
+        self.enabled: bool = True
 
-    def set_alive_target_command(self, cmd: str):
-        print(f"[HpActionController] Установлена команда alive_target: {cmd}")
-        self.alive_target_command = cmd.strip() if cmd else None
+    # --- Public setters (UI uses these) ---
+    def _to_sequence(self, val) -> list:
+        """Normalize input to list of strings. Accept string with ';' as delimiter or a sequence."""
+        if val is None:
+            return []
+        if isinstance(val, (list, tuple)):
+            return [str(x) for x in val if x is not None and str(x).strip()]
+        s = str(val)
+        # поддержка старого формата: разделитель ';'
+        parts = [p.strip() for p in s.split(";")]
+        return [p for p in parts if p]
 
-    # Новый сеттер для far_target
-    def set_far_target_command(self, cmd: str):
-        print(f"[HpActionController] Установлена команда far_target: {cmd}")
-        self.far_target_command = cmd.strip() if cmd else None
+    def set_no_target_command(self, cmd):
+        seq = self._to_sequence(cmd)
+        print(f"[HpActionController] set_no_target_command -> {seq}")
+        self.no_target_sequence = seq
+        self._seq_indices[self.STATE_NO_TARGET] = 0
+
+    def set_dead_target_command(self, cmd):
+        seq = self._to_sequence(cmd)
+        print(f"[HpActionController] set_dead_target_command -> {seq}")
+        self.dead_target_sequence = seq
+        self._seq_indices[self.STATE_DEAD_TARGET] = 0
+
+    def set_alive_target_command(self, cmd):
+        seq = self._to_sequence(cmd)
+        print(f"[HpActionController] set_alive_target_command -> {seq}")
+        self.alive_target_sequence = seq
+        self._seq_indices[self.STATE_ALIVE_TARGET] = 0
+
+    def set_far_target_command(self, cmd):
+        seq = self._to_sequence(cmd)
+        print(f"[HpActionController] set_far_target_command -> {seq}")
+        self.far_target_sequence = seq
+        self._seq_indices[self.STATE_FAR_TARGET] = 0
 
     def set_sweep_key(self, key: str):
-        print(f"[HpActionController] Установлен sweep_key: {key}")
+        print(f"[HpActionController] set_sweep_key: {key}")
         self.sweep_key = key.strip() if key else None
 
     def set_cooldown(self, cooldown: float):
-        print(f"[HpActionController] Установлен cooldown: {cooldown}")
-        self.cooldown_sec = cooldown
+        print(f"[HpActionController] set_cooldown: {cooldown}")
+        self.cooldown_sec = float(cooldown)
 
     def set_spoil_enabled(self, enabled: bool):
-        print(f"[HpActionController] Установлен spoil_enabled: {enabled}")
-        self.spoil_enabled = enabled
+        print(f"[HpActionController] set_spoil_enabled: {enabled}")
+        self.spoil_enabled = bool(enabled)
 
-    # Сеттеры для порога и eps (новые)
     def set_hp_stable_threshold(self, seconds: float):
-        print(f"[HpActionController] Установлен hp_stable_threshold_sec: {seconds}")
+        print(f"[HpActionController] set_hp_stable_threshold: {seconds}")
         try:
             self.hp_stable_threshold_sec = float(seconds)
         except Exception:
             pass
 
     def set_hp_change_epsilon(self, eps: float):
-        print(f"[HpActionController] Установлен hp_change_epsilon: {eps}")
+        print(f"[HpActionController] set_hp_change_epsilon: {eps}")
         try:
             self.hp_change_epsilon = float(eps)
         except Exception:
             pass
 
+    def set_far_transient(self, transient: bool):
+        print(f"[HpActionController] set_far_transient: {transient}")
+        self.far_transient = bool(transient)
+
     def set_spoil_state(self, is_spoiled: bool, can_sweep: bool):
-        self.spoil_active = is_spoiled
-        self.waiting_for_sweep = can_sweep
-        print(
-            f"[HpActionController] set_spoil_state: spoil_active={self.spoil_active}, waiting_for_sweep={self.waiting_for_sweep}"
-        )
+        self.spoil_active = bool(is_spoiled)
+        self.waiting_for_sweep = bool(can_sweep)
+        print(f"[HpActionController] set_spoil_state: spoil_active={{self.spoil_active}}, waiting_for_sweep={{self.waiting_for_sweep}}")
 
+    # --- Internal helpers ---
+    def _send_command(self, cmd: str, now: float) -> None:
+        """Send a single command, respect cooldown/last_command."""
+        if not cmd:
+            return
+        if self.last_command == cmd and (now - self.last_command_time) <= self.cooldown_sec:
+            print(f"[HpActionController] skip send '{cmd}' due cooldown")
+            return
+        print(f"[HpActionController] send command: {cmd}")
+        self.send_command_callback(cmd)
+        self.last_command = cmd
+        self.last_command_time = now
+
+    def _send_next_in_sequence(self, state: str, now: float) -> None:
+        """Pick next command from sequence assigned to state and send it (round-robin)."""
+        seq_map = {
+            self.STATE_NO_TARGET: self.no_target_sequence,
+            self.STATE_DEAD_TARGET: self.dead_target_sequence,
+            self.STATE_ALIVE_TARGET: self.alive_target_sequence,
+            self.STATE_FAR_TARGET: self.far_target_sequence,
+        }
+        seq = seq_map.get(state, [])
+        if not seq:
+            return
+        idx = self._seq_indices.get(state, 0) % len(seq)
+        cmd = seq[idx]
+        self._send_command(cmd, now)
+        # advance index
+        self._seq_indices[state] = (idx + 1) % len(seq)
+
+    def _is_hp_stable(self, hp_percent: float, now: float) -> bool:
+        if self.hp_last_value is None:
+            return False
+        if abs(hp_percent - self.hp_last_value) > self.hp_change_epsilon:
+            # hp changed -> reset baseline
+            self.hp_last_value = hp_percent
+            self.hp_last_change_time = now
+            print(f"[HpActionController] HP changed -> reset baseline to {{hp_percent}}")
+            return False
+        stable_duration = now - (self.hp_last_change_time or now)
+        print(f"[HpActionController] HP stable for {{stable_duration:.2f}}s (threshold {{self.hp_stable_threshold_sec}}s)")
+        return stable_duration >= self.hp_stable_threshold_sec
+
+    def _enter_far_and_forget(self, now: float, hp_percent: float) -> None:
+        """Send far sequence next and 'forget' far: reset baseline so controller continues normal alive processing."""
+        # avoid duplicate for same stability window
+        if self.far_sent_time is not None and (self.far_sent_time >= (self.hp_last_change_time or 0)):
+            print("[HpActionController] far already sent for this stability -> skip")
+            return
+        # send next command in far sequence
+        self._send_next_in_sequence(self.STATE_FAR_TARGET, now)
+        self.far_sent_time = now
+        print(f"[HpActionController] far sent at {{self.far_sent_time}}")
+        # FORGET far: reset hp tracking baseline and mark state as changed so controller treats subsequent alive as new target.
+        # Important: we set hp_last_value = None so next update will initialize tracking as for a new target.
+        self.hp_last_value = None
+        self.hp_last_change_time = 0.0
+        # mark that controller should not consider itself currently in alive/far, so next update triggers "new target" logic
+        self.current_state = None
+        print("[HpActionController] Forgot far: hp baseline cleared and current_state set to None (new target will be treated on next update)")
+
+    # --- Main update logic ---
     def update(self, target_state: str, hp_percent: float):
-        print(
-            f"[HpActionController] update start: spoil_active={self.spoil_active}, current_state={self.current_state}, target_state={target_state}"
-        )
+        print(f"[HpActionController] update: {{self.current_state}} -> {{target_state}}, hp={{hp_percent}}")
 
         if not self.enabled:
-            print("[HpActionController] update: обработка выключена, ничего не делаем")
+            print("[HpActionController] controller disabled, skipping update")
             return
 
         now = time.time()
 
-        if self.spoil_enabled:
-            if (
-                self.current_state != target_state
-            ) and target_state == "alive_target":  # цель изменилась
-                print("[HpActionController] Новая цель — сброс состояния спойла")
-                self.spoil_active = False
-                self.waiting_for_sweep = False
+        # spoil reset on new live target
+        if self.spoil_enabled and self.current_state != target_state and target_state == self.STATE_ALIVE_TARGET:
+            print("[HpActionController] New target -> reset spoil state")
+            self.spoil_active = False
+            self.waiting_for_sweep = False
 
-        """
-        Обновить состояние цели и отправить команду при необходимости.
-        Также управляет логикой спойла и свипа.
+        # handle no_target and dead_target
+        if target_state in (self.STATE_NO_TARGET, self.STATE_DEAD_TARGET):
+            # reset hp tracking and far marker
+            self.hp_last_value = None
+            self.hp_last_change_time = 0.0
+            self.far_sent_time = None
 
-        :param target_state: "no_target", "dead_target", "alive_target"
-        :param hp_percent: процент HP (float)
-        """
-        print(
-            f"[HpActionController] update: target_state={target_state}, hp_percent={hp_percent}, enabled={self.enabled}"
-        )
+            if target_state == self.STATE_NO_TARGET:
+                self._send_next_in_sequence(self.STATE_NO_TARGET, now)
+            else:
+                self._send_next_in_sequence(self.STATE_DEAD_TARGET, now)
 
-        if not self.enabled:
-            print("[HpActionController] update: обработка выключена, ничего не делаем")
-            return
-
-        now = time.time()
-
-        # Сброс спойла при смене цели на живую
-        if self.spoil_enabled:
-            if (
-                self.current_state in [None, "no_target", "dead_target"]
-                and target_state == "alive_target"
-                and not self.spoil_active  # Добавлено условие
-            ):
-                print("[HpActionController] Новая цель — сброс состояния спойла")
-                self.spoil_active = False
-                self.waiting_for_sweep = False
-
-            # Если цель умерла и спойл активен и можно свипать, отправляем свип
-            if (
-                target_state == "dead_target"
-                and self.spoil_active
-                and self.waiting_for_sweep
-            ):
+            if target_state == self.STATE_DEAD_TARGET and self.spoil_active and self.waiting_for_sweep:
                 self.try_sweep()
                 self.waiting_for_sweep = False
 
-        cmd_map = {
-            "no_target": self.no_target_command,
-            "dead_target": self.dead_target_command,
-            "alive_target": None,  # обработаем отдельно
-            # поддержка far_target (новое)
-            "far_target": self.far_target_command,
-        }
+            self.current_state = target_state
+            return
 
-        # --- Новая логика: определение effective_state с учётом стабильности HP ---
-        effective_state = target_state
+        # now target_state == alive
+        # init tracking baseline if necessary
+        if self.hp_last_value is None or self.current_state not in (self.STATE_ALIVE_TARGET, self.STATE_FAR_TARGET):
+            self.hp_last_value = hp_percent
+            self.hp_last_change_time = now
+            self.far_sent_time = None
+            print("[HpActionController] Init HP tracking for live target")
 
-        if target_state == "alive_target":
-            # инициализация трекинга HP при заходе на живую цель
-            if self.hp_last_value is None or self.current_state not in ["alive_target", "far_target"]:
-                self.hp_last_value = hp_percent
-                self.hp_last_change_time = now
-                print("[HpActionController] Инициализирован трекинг HP для живой цели")
+        # check HP stability
+        if self._is_hp_stable(hp_percent, now):
+            # send far command once and forget far (return to alive processing)
+            self._enter_far_and_forget(now, hp_percent)
+            # after this we treat target as new on next update (current_state was set to None inside helper)
+            return
 
-            # если HP изменился существенно — обновляем время изменения
-            if abs(hp_percent - (self.hp_last_value if self.hp_last_value is not None else hp_percent)) > getattr(self, "hp_change_epsilon", 0.01):
-                self.hp_last_value = hp_percent
-                self.hp_last_change_time = now
-                print(f"[HpActionController] HP изменился: {hp_percent} (сброс таймера стабильности)")
-                if self.current_state == "far_target":
-                    print("[HpActionController] Цель перестала быть 'далеко' — HP пошёл")
+        # HP changed -> normal alive processing (spoil/attack)
+        if self.spoil_enabled:
+            if not self.spoil_active:
+                print("[HpActionController] try to spoil")
+                self.try_spoil()
             else:
-                # HP не изменился существенно — проверяем длительность стабильности
-                stable_duration = now - (self.hp_last_change_time or now)
-                print(f"[HpActionController] HP стабилен уже {stable_duration:.2f}s (порог {getattr(self, 'hp_stable_threshold_sec', 2.0)}s)")
-                if stable_duration >= getattr(self, "hp_stable_threshold_sec", 2.0):
-                    effective_state = "far_target"
+                # send next alive command in sequence
+                self._send_next_in_sequence(self.STATE_ALIVE_TARGET, now)
         else:
-            # если цели нет или она мертва — сбрасываем трекинг HP
-            if self.hp_last_value is not None:
-                print("[HpActionController] Сбрасываю трекинг HP (цель не жива или отсутствует)")
-            self.hp_last_value = None
-            self.hp_last_change_time = 0.0
+            self._send_next_in_sequence(self.STATE_ALIVE_TARGET, now)
 
-        # Отправка команд для no_target, dead_target, far_target
-        if effective_state in ["no_target", "dead_target", "far_target"]:
-            cmd = cmd_map.get(effective_state)
-            if cmd and (
-                self.last_command != cmd
-                or now - self.last_command_time > self.cooldown_sec
-            ):
-                print(f"[HpActionController] Отправляю команду {effective_state}: {cmd}")
-                self.send_command_callback(cmd)
-                self.last_command = cmd
-                self.last_command_time = now
+        self.current_state = self.STATE_ALIVE_TARGET
 
-                # Новая логика: far_target — одноразовое (транзиентное) событие.
-                # После отправки команды для далёкой цели, если целевая сущность по-прежнему жива,
-                # мы сбрасываем статус "далеко" и продолжаем работу как для живой цели:
-                # просто перезапускаем трекинг HP и не шлём немедленно команду для alive.
-                if effective_state == "far_target" and target_state == "alive_target":
-                    print("[HpActionController] После команды far_target: выполняем транзиентный сброс far-статуса и перезапускаем трекинг HP")
-                    # Считаем текущее значение HP стартовым для нового ожидания
-                    self.hp_last_value = hp_percent
-                    self.hp_last_change_time = now
-                    # Вернёмся к состоянию alive — дальнейшая логика будет работать на следующих вызовах update
-                    effective_state = "alive_target"
-                    # Обновляем current_state, но не выполняем атаку сейчас — завершаем update,
-                    # чтобы следующая итерация уже шла с обновлённым трекингом.
-                    self.current_state = "alive_target"
-                    return
-
-        # Обработка alive_target с учётом спойла
-        if effective_state == "alive_target":
-            if self.spoil_enabled:
-                if not self.spoil_active:
-                    print(
-                        "[HpActionController] Спойл не активен, пытаемся применить спойл"
-                    )
-                    self.try_spoil()
-                else:
-                    if self.alive_target_command and (
-                        self.last_command != self.alive_target_command
-                        or now - self.last_command_time > self.cooldown_sec
-                    ):
-                        print("[HpActionController] Спойл активен — атакуем цель")
-                        self.send_command_callback(self.alive_target_command)
-                        self.last_command = self.alive_target_command
-                        self.last_command_time = now
-            else:
-                if self.alive_target_command and (
-                    self.last_command != self.alive_target_command
-                    or now - self.last_command_time > self.cooldown_sec
-                ):
-                    print(
-                        f"[HpActionController] Отправляю команду alive_target: {self.alive_target_command}"
-                    )
-                    self.send_command_callback(self.alive_target_command)
-                    self.last_command = self.alive_target_command
-                    self.last_command_time = now
-        else:
-            if effective_state not in ["no_target", "dead_target", "far_target", "alive_target"]:
-                print(f"[HpActionController] Неизвестное состояние: {effective_state}")
-
-        self.current_state = effective_state
-
+    # spoil / sweep
     def try_spoil(self):
         if self.spoil_key and not self.spoil_active:
-            print(f"[HpActionController] Отправляю Spoil: {self.spoil_key}")
+            print(f"[HpActionController] try_spoil send {{self.spoil_key}}")
             self.send_command_callback(self.spoil_key)
         else:
-            print("[HpActionController] Спойл уже активен или ключ не задан")
+            print("[HpActionController] try_spoil: already spoiled or no key")
 
     def try_sweep(self):
         if hasattr(self, "sweep_key") and self.sweep_key:
-            print(f"[HpActionController] Отправляю Sweep: {self.sweep_key}")
+            print(f"[HpActionController] try_sweep send {{self.sweep_key}}")
             self.send_command_callback(self.sweep_key)
         else:
-            print("[HpActionController] Ключ свипа не задан")
+            print("[HpActionController] try_sweep: sweep key not set")
 
+    # control
     def stop(self):
         self.enabled = False
         self.spoil_active = False
         self.waiting_for_sweep = False
         self.current_state = None
         self.last_command = None
-        self.last_command_time = 0
+        self.last_command_time = 0.0
         self.hp_last_value = None
         self.hp_last_change_time = 0.0
-        print("[HpActionController] Контроллер остановлен")
+        self.far_sent_time = None
+        # reset indices
+        for k in self._seq_indices:
+            self._seq_indices[k] = 0
+        print("[HpActionController] stopped")
 
     def start(self):
         self.enabled = True
-        print("[HpActionController] Контроллер запущен")
+        print("[HpActionController] started")
