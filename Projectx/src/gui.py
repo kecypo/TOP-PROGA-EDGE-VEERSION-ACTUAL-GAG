@@ -5,6 +5,11 @@ from PIL import Image, ImageTk
 import cv2
 import numpy as np
 import pyautogui
+import os
+import time
+
+# central config for controller settings
+import config
 
 from arduino_controller import ArduinoController
 from arduino_auto import auto_detect_all_ports
@@ -60,13 +65,21 @@ class Interface(tk.Tk):
             self, text="Открыть обработчик чата", command=self.open_chat_handler_window
         )
         self.open_chat_handler_btn.pack(pady=10)
-        self.mob_searcher = MobSearcher(template_path=r"E:/Projectx/src/cross.jpg")
+
+        # Mob searcher init (path may need adjustment)
+        try:
+            self.mob_searcher = MobSearcher(template_path=r"E:/Projectx/src/cross.jpg")
+        except Exception as e:
+            # Fallback: instantiate without template if not found to avoid crash in UI
+            print(f"[GUI] MobSearcher init error: {e}")
+            self.mob_searcher = None
 
         # Кнопка запуска поиска мобов
         self.mob_search_btn = tk.Button(
             self, text="Поиск мобов", command=self.start_mob_search
         )
         self.mob_search_btn.pack(pady=10)
+
         # Колбэки
         self.on_select_area = on_select_area
         self.on_arduino_found = on_arduino_found
@@ -142,9 +155,25 @@ class Interface(tk.Tk):
         )
         self.hp_stop_btn.pack(pady=5)
 
-        # Инициализация контроллера событий HpActionController
+        # Инициализация контроллера событий HpActionController с настройками из config
+        try:
+            cfg = config.load_config()
+        except Exception as e:
+            print(f"[GUI] Error loading config: {e}")
+            cfg = {}
+
         self.hp_action_controller = HpActionController(
             send_command_callback=self.send_key_to_arduino,
+            spoil_key=cfg.get("spoil_key", "F2"),
+            no_target_command=cfg.get("no_target_command", []),
+            dead_target_command=cfg.get("dead_target_command", []),
+            alive_target_command=cfg.get("alive_target_command", []),
+            far_target_command=cfg.get("far_target_command", []),
+            spoil_enabled=cfg.get("spoil_enabled", True),
+            cooldown_sec=cfg.get("cooldown_sec", 0.5),
+            hp_stable_threshold_sec=cfg.get("hp_stable_threshold_sec", 2.0),
+            hp_change_epsilon=cfg.get("hp_change_epsilon", 0.01),
+            far_transient=cfg.get("far_transient", True),
         )
 
         # Запуск автоопределения Arduino портов
@@ -171,6 +200,15 @@ class Interface(tk.Tk):
         ).start()
 
     def mob_search_thread(self, x, y, w, h, exclude_rects):
+        if not self.mob_searcher:
+            self.after(
+                0,
+                lambda: messagebox.showinfo(
+                    "Результат", "MobSearcher не инициализирован"
+                ),
+            )
+            return
+
         monitor_region = {"top": y, "left": x, "width": w, "height": h}
         targets = self.mob_searcher.search(
             monitor_region, exclude_rects, arduino_controller=self.arduino
@@ -390,11 +428,10 @@ if __name__ == "__main__":
         "F12",
     ]
 
-    def dummy_select(*args):
-        pass
-
-    def dummy_found(*args):
-        pass
-
-    app = Interface(arduino_ports, key_names, dummy_select, dummy_found)
+    app = Interface(
+        arduino_ports=arduino_ports,
+        key_names=key_names,
+        on_select_area=lambda sel: print("Selected area:", sel),
+        on_arduino_found=lambda port: print(f"Arduino on {port}"),
+    )
     app.mainloop()
