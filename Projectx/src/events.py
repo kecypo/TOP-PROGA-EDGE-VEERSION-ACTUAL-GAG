@@ -8,7 +8,8 @@ class HpActionController:
     STATE_ALIVE_TARGET = "alive_target"
     STATE_FAR_TARGET = "far_target"
 
-    def __init__(self,
+    def __init__(
+        self,
         send_command_callback: Callable[[str], None],
         spoil_key: str = "F2",
         no_target_command: Optional[Sequence[str]] = None,
@@ -30,9 +31,15 @@ class HpActionController:
         self.spoil_key = spoil_key
         # команды храним как списки (последовательности). Для совместимости допускаем и строки в сеттерах.
         self.no_target_sequence = list(no_target_command) if no_target_command else []
-        self.dead_target_sequence = list(dead_target_command) if dead_target_command else []
-        self.alive_target_sequence = list(alive_target_command) if alive_target_command else []
-        self.far_target_sequence = list(far_target_command) if far_target_command else []
+        self.dead_target_sequence = (
+            list(dead_target_command) if dead_target_command else []
+        )
+        self.alive_target_sequence = (
+            list(alive_target_command) if alive_target_command else []
+        )
+        self.far_target_sequence = (
+            list(far_target_command) if far_target_command else []
+        )
 
         self.spoil_enabled = spoil_enabled
         self.cooldown_sec = float(cooldown_sec)
@@ -66,6 +73,10 @@ class HpActionController:
         }
 
         self.enabled: bool = True
+
+    def set_spoil_key(self, key: str):
+        print(f"[HpActionController] set_spoil_key: {key}")
+        self.spoil_key = key.strip() if key else None
 
     # --- Public setters (UI uses these) ---
     def _to_sequence(self, val) -> list:
@@ -136,14 +147,19 @@ class HpActionController:
     def set_spoil_state(self, is_spoiled: bool, can_sweep: bool):
         self.spoil_active = bool(is_spoiled)
         self.waiting_for_sweep = bool(can_sweep)
-        print(f"[HpActionController] set_spoil_state: spoil_active={{self.spoil_active}}, waiting_for_sweep={{self.waiting_for_sweep}}")
+        print(
+            f"[HpActionController] set_spoil_state: spoil_active={self.spoil_active}, waiting_for_sweep={self.waiting_for_sweep}"
+        )
 
     # --- Internal helpers ---
     def _send_command(self, cmd: str, now: float) -> None:
         """Send a single command, respect cooldown/last_command."""
         if not cmd:
             return
-        if self.last_command == cmd and (now - self.last_command_time) <= self.cooldown_sec:
+        if (
+            self.last_command == cmd
+            and (now - self.last_command_time) <= self.cooldown_sec
+        ):
             print(f"[HpActionController] skip send '{cmd}' due cooldown")
             return
         print(f"[HpActionController] send command: {cmd}")
@@ -175,33 +191,41 @@ class HpActionController:
             # hp changed -> reset baseline
             self.hp_last_value = hp_percent
             self.hp_last_change_time = now
-            print(f"[HpActionController] HP changed -> reset baseline to {{hp_percent}}")
+            print(f"[HpActionController] HP changed -> reset baseline to {hp_percent}")
             return False
         stable_duration = now - (self.hp_last_change_time or now)
-        print(f"[HpActionController] HP stable for {{stable_duration:.2f}}s (threshold {{self.hp_stable_threshold_sec}}s)")
+        print(
+            f"[HpActionController] HP stable for {stable_duration:.2f}s (threshold {self.hp_stable_threshold_sec}s)"
+        )
         return stable_duration >= self.hp_stable_threshold_sec
 
     def _enter_far_and_forget(self, now: float, hp_percent: float) -> None:
         """Send far sequence next and 'forget' far: reset baseline so controller continues normal alive processing."""
         # avoid duplicate for same stability window
-        if self.far_sent_time is not None and (self.far_sent_time >= (self.hp_last_change_time or 0)):
+        if self.far_sent_time is not None and (
+            self.far_sent_time >= (self.hp_last_change_time or 0)
+        ):
             print("[HpActionController] far already sent for this stability -> skip")
             return
         # send next command in far sequence
         self._send_next_in_sequence(self.STATE_FAR_TARGET, now)
         self.far_sent_time = now
-        print(f"[HpActionController] far sent at {{self.far_sent_time}}")
+        print(f"[HpActionController] far sent at {self.far_sent_time}")
         # FORGET far: reset hp tracking baseline and mark state as changed so controller treats subsequent alive as new target.
         # Important: we set hp_last_value = None so next update will initialize tracking as for a new target.
         self.hp_last_value = None
         self.hp_last_change_time = 0.0
         # mark that controller should not consider itself currently in alive/far, so next update triggers "new target" logic
         self.current_state = None
-        print("[HpActionController] Forgot far: hp baseline cleared and current_state set to None (new target will be treated on next update)")
+        print(
+            "[HpActionController] Forgot far: hp baseline cleared and current_state set to None (new target will be treated on next update)"
+        )
 
     # --- Main update logic ---
     def update(self, target_state: str, hp_percent: float):
-        print(f"[HpActionController] update: {{self.current_state}} -> {{target_state}}, hp={{hp_percent}}")
+        print(
+            f"[HpActionController] update: {self.current_state} -> {target_state}, hp={hp_percent}"
+        )
 
         if not self.enabled:
             print("[HpActionController] controller disabled, skipping update")
@@ -210,7 +234,11 @@ class HpActionController:
         now = time.time()
 
         # spoil reset on new live target
-        if self.spoil_enabled and self.current_state != target_state and target_state == self.STATE_ALIVE_TARGET:
+        if (
+            self.spoil_enabled
+            and self.current_state != target_state
+            and target_state == self.STATE_ALIVE_TARGET
+        ):
             print("[HpActionController] New target -> reset spoil state")
             self.spoil_active = False
             self.waiting_for_sweep = False
@@ -227,7 +255,11 @@ class HpActionController:
             else:
                 self._send_next_in_sequence(self.STATE_DEAD_TARGET, now)
 
-            if target_state == self.STATE_DEAD_TARGET and self.spoil_active and self.waiting_for_sweep:
+            if (
+                target_state == self.STATE_DEAD_TARGET
+                and self.spoil_active
+                and self.waiting_for_sweep
+            ):
                 self.try_sweep()
                 self.waiting_for_sweep = False
 
@@ -236,7 +268,10 @@ class HpActionController:
 
         # now target_state == alive
         # init tracking baseline if necessary
-        if self.hp_last_value is None or self.current_state not in (self.STATE_ALIVE_TARGET, self.STATE_FAR_TARGET):
+        if self.hp_last_value is None or self.current_state not in (
+            self.STATE_ALIVE_TARGET,
+            self.STATE_FAR_TARGET,
+        ):
             self.hp_last_value = hp_percent
             self.hp_last_change_time = now
             self.far_sent_time = None
@@ -265,14 +300,14 @@ class HpActionController:
     # spoil / sweep
     def try_spoil(self):
         if self.spoil_key and not self.spoil_active:
-            print(f"[HpActionController] try_spoil send {{self.spoil_key}}")
+            print(f"[HpActionController] try_spoil send {self.spoil_key}")
             self.send_command_callback(self.spoil_key)
         else:
             print("[HpActionController] try_spoil: already spoiled or no key")
 
     def try_sweep(self):
         if hasattr(self, "sweep_key") and self.sweep_key:
-            print(f"[HpActionController] try_sweep send {{self.sweep_key}}")
+            print(f"[HpActionController] try_sweep send {self.sweep_key}")
             self.send_command_callback(self.sweep_key)
         else:
             print("[HpActionController] try_sweep: sweep key not set")
